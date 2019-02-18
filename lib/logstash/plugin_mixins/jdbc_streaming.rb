@@ -36,6 +36,20 @@ module LogStash module PluginMixins module JdbcStreaming
     # Connection pool configuration.
     # How often to validate a connection (in seconds)
     config :jdbc_validation_timeout, :validate => :number, :default => 3600
+
+    # Maximum number of times to retry connecting to database.
+    # Setting it to 0 disables connection retry.
+    config :connection_retry_attempts, :validate => :number, :default => 0
+
+    # Number of seconds to sleep between connection retry attempts.
+    config :connection_retry_attempts_wait_time, :validate => :number, :default => 0.5
+
+    # Minimum number of seconds to wait before the next connection retry circle starts.
+    #
+    # While `connection_retry_attempts_wait_time` waits per event and thus blocks the pipeline,
+    # `connection_retry_delay` skips connection retries for all events that are processed
+    # in the given time frame.
+    config :connection_retry_delay, :validate => :number, :default => 300
   end
 
   public
@@ -50,16 +64,25 @@ module LogStash module PluginMixins module JdbcStreaming
     end
 
     Sequel::JDBC.load_driver(@jdbc_driver_class)
-    @database = Sequel.connect(@jdbc_connection_string, :user=> @jdbc_user, :password=>  @jdbc_password.nil? ? nil : @jdbc_password.value)
-    if @jdbc_validate_connection
-      @database.extension(:connection_validator)
-      @database.pool.connection_validation_timeout = @jdbc_validation_timeout
-    end
-    begin
-      @database.test_connection
-    rescue Sequel::DatabaseConnectionError => e
-      #TODO return false and let the plugin raise a LogStash::ConfigurationError
-      raise e
-    end
+    retry_jdbc_connect(@connection_retry_attempts + 1)
   end # def prepare_jdbc_connection
+
+  def retry_jdbc_connect(number_of_attempts=@connection_retry_attempts)
+    last_exception = nil
+    if number_of_attempts.times do |i|
+      begin
+        @database = Sequel.connect(@jdbc_connection_string, :user=> @jdbc_user, :password=>  @jdbc_password.nil? ? nil : @jdbc_password.value)
+        if @jdbc_validate_connection
+          @database.extension(:connection_validator)
+          @database.pool.connection_validation_timeout = @jdbc_validation_timeout
+        end
+        @database.test_connection
+        break
+      rescue ::Sequel::Error => last_exception
+        sleep @connection_retry_attempts_wait_time if i < number_of_attempts - 1
+      end
+    end == number_of_attempts
+      raise last_exception
+    end
+  end # def retry_jdbc_connect
 end end end

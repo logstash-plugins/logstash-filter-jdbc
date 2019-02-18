@@ -92,6 +92,9 @@ module LogStash module Filters class JdbcStreaming < LogStash::Filters::Base
   # Append values to the `tags` field if no record was found and default values were used
   config :tag_on_default_use, :validate => :array, :default => ["_jdbcstreamingdefaultsused"]
 
+  # Append values to the `tags` field if any records were found
+  config :tag_on_success, :validate => :array, :default => []
+
   # Enable or disable caching, boolean true or false, defaults to true
   config :use_cache, :validate => :boolean, :default => true
 
@@ -114,6 +117,7 @@ module LogStash module Filters class JdbcStreaming < LogStash::Filters::Base
   def register
     convert_config_options
     prepare_connected_jdbc_cache
+    @last_retry_timestamp = 0
   end
 
   def filter(event)
@@ -127,6 +131,7 @@ module LogStash module Filters class JdbcStreaming < LogStash::Filters::Base
       tag_default(event)
       process_event(event, @default_array)
     else
+      tag_success(event)
       process_event(event, result.payload)
     end
   end
@@ -137,22 +142,45 @@ module LogStash module Filters class JdbcStreaming < LogStash::Filters::Base
   def cache_lookup(event)
     params = prepare_parameters_from_event(event)
     @cache.get(params) do
-      result = CachePayload.new
-      begin
-        query = @database[@statement, params] # returns a dataset
-        @logger.debug? && @logger.debug("Executing JDBC query", :statement => @statement, :parameters => params)
-        query.all do |row|
-          result.push row.inject({}){|hash,(k,v)| hash[k.to_s] = v; hash} #Stringify row keys
-        end
-      rescue ::Sequel::Error => e
-        # all sequel errors are a subclass of this, let all other standard or runtime errors bubble up
-        result.failed!
-        @logger.warn? && @logger.warn("Exception when executing JDBC query", :exception => e)
-      end
-      # if either of: no records or a Sequel exception occurs the payload is
-      # empty and the default can be substituted later.
-      result
+      execute_query(params, event.timestamp.to_f)
     end
+  end
+
+  def execute_query(params, event_timestamp)
+    result = CachePayload.new
+    begin
+      query = @database[@statement, params] # returns a dataset
+      @logger.debug? && @logger.debug("Executing JDBC query", :statement => @statement, :parameters => params)
+      query.all do |row|
+        result.push row.inject({}){|hash,(k,v)| hash[k.to_s] = v; hash} #Stringify row keys
+      end
+    rescue ::Sequel::Error => e
+      if @connection_retry_attempts > 0
+        if event_timestamp - @last_retry_timestamp >= @connection_retry_delay
+          @last_retry_timestamp = event_timestamp
+          # Unfortunately a query timeout causes a DatabaseError like many other circumstances,
+          # so we have to manually validate the connection(s).
+          @database.synchronize do |conn|
+            begin
+              unless @database.valid_connection?(conn)
+                @logger.warn? && @logger.warn("No connection to database. Reconnecting #{@connection_retry_attempts} times...", :exception => e)
+                retry_jdbc_connect
+                @logger.debug? && @logger.debug("Connection reestablished")
+                return execute_query(params, event_timestamp)
+              end
+            rescue ::Sequel::Error => recon_e
+              @logger.warn? && @logger.warn("Reconnecting failed", :exception => recon_e)
+            end
+          end
+        end
+      end
+      # all sequel errors are a subclass of this, let all other standard or runtime errors bubble up
+      result.failed!
+      @logger.warn? && @logger.warn("Exception when executing JDBC query", :exception => e)
+    end
+    # if either of: no records or a Sequel exception occurs the payload is
+    # empty and the default can be substituted later.
+    result
   end
 
   def prepare_parameters_from_event(event)
@@ -171,6 +199,12 @@ module LogStash module Filters class JdbcStreaming < LogStash::Filters::Base
 
   def tag_default(event)
     @tag_on_default_use.each do |tag|
+      event.tag(tag)
+    end
+  end
+
+  def tag_success(event)
+    @tag_on_success.each do |tag|
       event.tag(tag)
     end
   end
