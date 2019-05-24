@@ -114,6 +114,7 @@ module LogStash module Filters class JdbcStreaming < LogStash::Filters::Base
   def register
     convert_config_options
     prepare_connected_jdbc_cache
+    initialize_retry_timestamps
   end
 
   def filter(event)
@@ -143,22 +144,41 @@ module LogStash module Filters class JdbcStreaming < LogStash::Filters::Base
   def cache_lookup(event)
     params = prepare_parameters_from_event(event)
     @cache.get(params) do
-      result = CachePayload.new
-      begin
-        query = @database[@statement, params] # returns a dataset
-        @logger.debug? && @logger.debug("Executing JDBC query", :statement => @statement, :parameters => params)
-        query.all do |row|
-          result.push row.inject({}){|hash,(k,v)| hash[k.to_s] = v; hash} #Stringify row keys
-        end
-      rescue ::Sequel::Error => e
-        # all sequel errors are a subclass of this, let all other standard or runtime errors bubble up
-        result.failed!
-        @logger.warn? && @logger.warn("Exception when executing JDBC query", :exception => e)
-      end
-      # if either of: no records or a Sequel exception occurs the payload is
-      # empty and the default can be substituted later.
-      result
+      execute_query(params, event)
     end
+  end
+
+  def execute_query(params, event)
+    result = CachePayload.new
+    begin
+      query = @database[@statement, params] # returns a dataset
+      @logger.debug? && @logger.debug("Executing JDBC query", :statement => @statement, :parameters => params)
+      query.all do |row|
+        result.push row.inject({}){|hash,(k,v)| hash[k.to_s] = v; hash} #Stringify row keys
+      end
+    rescue ::Sequel::Error => e
+      if @connection_retry_attempts > 0
+        @last_retry_timestamp = @@global_retry_timestamps[@global_retry_delay_label] if global_retry
+        if event.timestamp.to_f - @last_retry_timestamp >= @connection_retry_delay
+          begin
+            @logger.warn? && @logger.warn("No connection to database. Reconnecting #{@connection_retry_attempts} times...", :exception => e)
+            jdbc_connect
+            @logger.debug? && @logger.debug("Connection reestablished")
+            return execute_query(params, event)
+          rescue ::Sequel::Error => recon_e
+            @last_retry_timestamp = event.timestamp.to_f
+            @@global_retry_timestamps[@global_retry_delay_label] = @last_retry_timestamp if global_retry
+            @logger.warn? && @logger.warn("Reconnecting failed", :exception => recon_e)
+          end
+        end
+      end
+      # all sequel errors are a subclass of this, let all other standard or runtime errors bubble up
+      result.failed!
+      @logger.warn? && @logger.warn("Exception when executing JDBC query", :exception => e)
+    end
+    # if either of: no records or a Sequel exception occurs the payload is
+    # empty and the default can be substituted later.
+    result
   end
 
   def prepare_parameters_from_event(event)
@@ -199,4 +219,18 @@ module LogStash module Filters class JdbcStreaming < LogStash::Filters::Base
     @cache = klass.new(@cache_size, @cache_expiration)
     prepare_jdbc_connection
   end
+
+  def initialize_retry_timestamps
+    if global_retry
+      @@global_retry_timestamps ||= {}
+      @@global_retry_timestamps[@global_retry_delay_label] = 0
+    else
+      @last_retry_timestamp = 0
+    end
+  end
+
+  def global_retry
+    !(@global_retry_delay_label.nil? || @global_retry_delay_label.empty?)
+  end
+
 end end end # class LogStash::Filters::Jdbc
